@@ -158,10 +158,15 @@ XML_VAZIO = ('<?xml version="1.0" encoding="utf-8"?><DataSet xmlns="http://MRCS/
              'xmlns:diffgr="urn:schemas-microsoft-com:xml-diffgram-v1"/></DataSet>')
 
 
-def rodar(args: list[str], env=None) -> subprocess.CompletedProcess:
+def rodar(args: list[str], env=None, criterios: bool = True) -> subprocess.CompletedProcess:
+    """Executa o programa sem terminal (stdin fechado). Os limites agora vêm do usuário:
+    se o teste não os informa, usa 20 anos e 10 %."""
+    if criterios and "--min-anos" not in args:
+        args = args + ["--min-anos", "20", "--max-falhas-pct", "10"]
     e = dict(os.environ)
     e.update(env or {})
-    return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=e)
+    return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=e,
+                          stdin=subprocess.DEVNULL)
 
 
 def esperado_df(esp: dict) -> pd.DataFrame:
@@ -342,6 +347,61 @@ def main() -> int:
     check(abs(R_obt - R_esp) < 0.05, f"R de A = {R_obt:.2f} (esperado {R_esp:.2f})")
     check(abs(float(re_[re_["Código"] == "01944009"]["IFM Fournier modificado (mm)"].iloc[0]) - c.sum()) < 0.02,
           "índice de Fournier modificado confere")
+
+    print("\n[10] Janela de anos, limites definidos pelo usuário e critério por mês removido")
+    r = rodar([str(est_txt), "--fonte", "local", "--pasta", str(pasta), "--saida", str(RAIZ / "out_win"),
+               "--ano-inicial", "2000", "--ano-final", "2010", "--min-anos", "10", "--max-falhas-pct", "10",
+               "--preencher", "nenhum"], criterios=False)
+    check(r.returncode == 0, f"execução com janela 2000–2010 terminou (stderr: {r.stderr[-300:]!r})")
+    rj = pd.read_csv(RAIZ / "out_win" / "resumo_geral.csv", sep=";", decimal=",", encoding="utf-8-sig",
+                     dtype={"Código": str})
+    sj = dict(zip(rj["Código"], rj["Situação"]))
+    check(sj.get("01944009") == "Aprovada" and sj.get("02347003") == "Aprovada",
+          "D (dados 1999–2010) passa a ser aprovada: só 2000–2010 conta, 11 anos ≥ 10")
+    check(sj.get("02447004") == "Reprovada", "E continua reprovada por falhas dentro da janela")
+    lj = rj[rj["Código"] == "01944009"].iloc[0]
+    check(lj["Período analisado"] == "01/2000 a 12/2010" and abs(lj["Anos de histórico"] - 11.0) < 1e-9,
+          f"A: período {lj['Período analisado']}, {lj['Anos de histórico']} anos")
+    for cod in (A, D):
+        med = esperado_df(esperado[cod]).loc[2000:2010].mean(axis=0)
+        li = rj[rj["Código"] == hp.fmt(cod)].iloc[0]
+        check(all(abs(li[f"P_{hp.MESES[i]} (mm)"] - med[i + 1]) < 0.006 for i in range(12)),
+              f"{hp.fmt(cod)}: médias mensais calculadas só com 2000–2010")
+    wbj = load_workbook(RAIZ / "out_win" / "estacoes" / "01944009.xlsx", data_only=True)
+    textos = [str(c.value) for row in wbj["Resumo"].iter_rows() for c in row if c.value is not None]
+    check("2000 a 2010" in textos, "planilha informa a janela de anos solicitada")
+    check(not any("Mín. de anos válidos" in t for t in textos), "critério por mês do calendário não aparece mais")
+    check(sum(1 for t in textos if t in ("Existência de dados (meses completos)",
+                                          "Anos de histórico (1º ao último mês com dado)",
+                                          "Meses com falha na janela (%)")) == 3, "restam os 3 critérios")
+    check("Mín. anos por mês" not in rj.columns, "resumo_geral sem a coluna do critério removido")
+
+    r = rodar([str(est_txt), "--fonte", "local", "--pasta", str(pasta), "--saida", str(RAIZ / "out_x"),
+               "--ano-inicial", "2010", "--ano-final", "2000"])
+    check(r.returncode == 2 and "ano-inicial" in r.stderr, "janela invertida é recusada")
+    r = rodar([str(est_txt), "--fonte", "local", "--pasta", str(pasta), "--saida", str(RAIZ / "out_x")],
+              criterios=False)
+    check(r.returncode == 2 and "--min-anos" in r.stderr and "--max-falhas-pct" in r.stderr,
+          "sem terminal e sem limites informados: recusa e diz o que falta")
+
+    # perguntas interativas (entrada simulada, com respostas inválidas no meio)
+    import argparse as _ap
+    respostas = iter(["abc", "1991", "1990", "1991", "2020", "", "-3", "20,5", "150", "10"])
+    a = _ap.Namespace(ano_inicio=None, ano_fim=None, min_anos=None, max_falhas_pct=None)
+    falt = hp.completar_parametros(a, True, entrada=lambda _t: next(respostas))
+    check((a.ano_inicio, a.ano_fim, a.min_anos, a.max_falhas_pct) == (1991, 2020, 20.5, 10.0) and falt == [],
+          "perguntas: rejeita texto, janela invertida, vazio, negativo e >100; aceita vírgula decimal")
+    a = _ap.Namespace(ano_inicio=None, ano_fim=None, min_anos=None, max_falhas_pct=None)
+    respostas = iter(["", "", "15", "5"])
+    hp.completar_parametros(a, True, entrada=lambda _t: next(respostas))
+    check(a.ano_inicio is None and a.ano_fim is None and a.min_anos == 15 and a.max_falhas_pct == 5,
+          "Enter em branco nos anos = sem limite")
+    a = _ap.Namespace(ano_inicio=1991, ano_fim=2020, min_anos=20.0, max_falhas_pct=10.0)
+
+    def _nao_deve_perguntar(_t):
+        raise AssertionError("não deveria perguntar")
+    check(hp.completar_parametros(a, True, entrada=_nao_deve_perguntar) == [],
+          "tudo informado por opção: não pergunta nada")
 
     # amostra para o usuário (dados inventados)
     shutil.copy(out / "estacoes" / "02047001.xlsx", AQUI / "exemplo_SINTETICO_estacao_02047001.xlsx")

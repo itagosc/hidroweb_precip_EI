@@ -21,7 +21,9 @@ Fluxo
 4. Monta SEMPRE o calendário completo (todos os anos x 12 meses) e marca o que
    falta. Assim, meses ausentes na fonte aparecem como falha em vez de sumirem.
 5. Aplica critérios eliminatórios (existência de dados, anos de histórico,
-   % de meses com falha, anos válidos por mês do calendário).
+   % de meses com falha). A janela de anos (ano inicial a final) e os limites
+   dos dois últimos critérios são definidos pelo usuário: por opção na linha de
+   comando ou, se omitidos, perguntados no terminal.
 6. Opcionalmente preenche meses faltantes por ponderação regional, usando as
    outras estações da própria lista como doadoras (valores preenchidos são
    sempre sinalizados e nunca entram nas médias "observadas").
@@ -31,6 +33,8 @@ Uso
 ---
     python hidroweb_precip.py estacoes.txt --fonte ws --saida saida
     python hidroweb_precip.py estacoes.txt --fonte local --pasta baixados --saida saida
+    python hidroweb_precip.py estacoes.txt --fonte local --pasta baixados \\
+        --ano-inicial 1991 --ano-final 2020 --min-anos 20 --max-falhas-pct 10
 """
 from __future__ import annotations
 
@@ -63,9 +67,9 @@ LOG = logging.getLogger("hidroweb")
 # --------------------------------------------------------------------------- #
 @dataclass
 class Criterios:
-    min_anos: float = 20.0          # anos de histórico (1º ao último mês com dado)
-    max_falhas_pct: float = 10.0    # % de meses sem total mensal válido na janela
-    min_anos_mes: int = 15          # anos válidos exigidos em CADA mês do calendário
+    min_anos: float = 0.0           # anos de histórico mínimos (1º ao último mês com dado)
+    max_falhas_pct: float = 100.0   # % máxima de meses sem total mensal válido
+    # (no programa, ambos vêm do usuário; 0 e 100 = "sem exigência" para uso como biblioteca)
     max_falhas_dia: int = 0         # dias sem leitura tolerados para validar um mês
     ano_inicio: int | None = None
     ano_fim: int | None = None
@@ -92,6 +96,13 @@ class Resultado:
 
 def fmt(cod: int) -> str:
     return f"{cod:08d}"
+
+
+def txt_janela_anos(crit: "Criterios") -> str:
+    if crit.ano_inicio is None and crit.ano_fim is None:
+        return "sem limite"
+    return f"{crit.ano_inicio if crit.ano_inicio is not None else 'início'} a " \
+           f"{crit.ano_fim if crit.ano_fim is not None else 'fim'}"
 
 
 # --------------------------------------------------------------------------- #
@@ -402,15 +413,12 @@ def processar_estacao(cod: int, diario: pd.DataFrame | None, crit: Criterios) ->
     n_ok = n_win - n_falhas
     falhas_pct = 100.0 * n_falhas / n_win
     anos_hist = n_win / 12.0
-    por_mes = res.mat.count()
     res.criterios = [
         ("Existência de dados (meses completos)", n_ok, "≥ 1", n_ok >= 1),
         ("Anos de histórico (1º ao último mês com dado)", round(anos_hist, 1),
          f"≥ {crit.min_anos:g}", anos_hist >= crit.min_anos),
         ("Meses com falha na janela (%)", round(falhas_pct, 1),
          f"≤ {crit.max_falhas_pct:g}", falhas_pct <= crit.max_falhas_pct),
-        ("Mín. de anos válidos em cada mês do calendário", int(por_mes.min()),
-         f"≥ {crit.min_anos_mes}", int(por_mes.min()) >= crit.min_anos_mes),
     ]
     res.motivos = [f"{n}: {v} (exigido {lim})" for n, v, lim, ok in res.criterios if not ok]
     res.situacao = "Aprovada" if not res.motivos else "Reprovada"
@@ -425,7 +433,6 @@ def processar_estacao(cod: int, diario: pd.DataFrame | None, crit: Criterios) ->
         "meses_validos": n_ok,
         "meses_falha": n_falhas,
         "falhas_pct": round(falhas_pct, 1),
-        "min_anos_mes": int(por_mes.min()),
         "dias_acumulados": int(m.dias_acumulados.sum()),
         "dias_duvidosos": int(m.dias_duvidosos.sum()),
         "meses_do_arquivo": int((m.do_arquivo & m.na_janela).sum()),
@@ -554,6 +561,7 @@ def escrever_planilha(res: Resultado, crit: Criterios, caminho: Path, fonte: str
     ws.write(0, 0, f"Estação {fmt(res.cod)} — precipitação (Hidroweb/ANA)", F["tit"])
     linhas = [
         ("Situação", res.situacao), ("Fonte dos dados", fonte), ("Janela analisada", res.info["periodo"]),
+        ("Janela de anos solicitada", txt_janela_anos(crit)),
         ("Anos de histórico", res.info["anos_hist"]), ("Meses na janela", res.info["meses_janela"]),
         ("Meses com total válido", res.info["meses_validos"]),
         ("Meses com falha", res.info["meses_falha"]), ("% de meses com falha", res.info["falhas_pct"]),
@@ -695,9 +703,8 @@ def linha_resumo(res: Resultado, crit: Criterios) -> dict:
     est = estatisticas(res.mat)
     ind = indices_erosividade(est, crit)
     row.update({
-        "Janela": res.info["periodo"], "Anos de histórico": res.info["anos_hist"],
+        "Período analisado": res.info["periodo"], "Anos de histórico": res.info["anos_hist"],
         "Meses com falha": res.info["meses_falha"], "% falhas": res.info["falhas_pct"],
-        "Mín. anos por mês": res.info["min_anos_mes"],
     })
     for i, mes in enumerate(est["med"].index):
         row[f"P_{MESES[i]} (mm)"] = round(float(est["med"][mes]), 2) if pd.notna(est["med"][mes]) else np.nan
@@ -715,6 +722,67 @@ def linha_resumo(res: Resultado, crit: Criterios) -> dict:
 # --------------------------------------------------------------------------- #
 # Programa principal
 # --------------------------------------------------------------------------- #
+def _perguntar(texto, converter, valido, ajuda, opcional=False, entrada=input):
+    """Pergunta no terminal até receber um valor válido (Enter vazio = None, se opcional)."""
+    while True:
+        try:
+            bruto = entrada(texto).strip().replace(",", ".")
+        except EOFError:
+            raise SystemExit("\nEntrada interrompida.")
+        if not bruto:
+            if opcional:
+                return None
+            print("  Resposta obrigatória.")
+            continue
+        try:
+            v = converter(bruto)
+        except ValueError:
+            v = None
+        if v is None or not valido(v):
+            print(f"  Valor inválido. {ajuda}")
+            continue
+        return v
+
+
+def completar_parametros(a, interativo: bool, entrada=input) -> list[str]:
+    """Pergunta o que não veio nas opções (janela de anos, anos de histórico, % de falhas).
+
+    Sem terminal interativo, a janela fica sem limite e os dois limites faltantes
+    são devolvidos na lista de retorno (o chamador deve recusar a execução)."""
+    faltando: list[str] = []
+    if interativo and None in (a.ano_inicio, a.ano_fim, a.min_anos, a.max_falhas_pct):
+        print("\nDefina os parâmetros da análise.")
+    if interativo:
+        ano_ok = lambda v: 1800 <= v <= 2100  # noqa: E731
+        while True:
+            if a.ano_inicio is None:
+                a.ano_inicio = _perguntar("Ano inicial da janela (Enter = sem limite): ", int,
+                                          ano_ok, "Digite um ano, por exemplo 1991.", True, entrada)
+            if a.ano_fim is None:
+                a.ano_fim = _perguntar("Ano final da janela (Enter = sem limite): ", int,
+                                       ano_ok, "Digite um ano, por exemplo 2020.", True, entrada)
+            if a.ano_inicio is not None and a.ano_fim is not None and a.ano_inicio > a.ano_fim:
+                print("  O ano inicial é maior que o final. Informe a janela de novo.")
+                a.ano_inicio = a.ano_fim = None
+                continue
+            break
+    if a.min_anos is None:
+        if interativo:
+            a.min_anos = _perguntar("Mínimo de anos de histórico (1º ao último mês com dado), ex. 20: ",
+                                    float, lambda v: 0 < v <= 200, "Digite um número maior que 0.",
+                                    False, entrada)
+        else:
+            faltando.append("--min-anos")
+    if a.max_falhas_pct is None:
+        if interativo:
+            a.max_falhas_pct = _perguntar("Máximo de meses com falha (%), ex. 10: ", float,
+                                          lambda v: 0 <= v <= 100, "Digite um número entre 0 e 100.",
+                                          False, entrada)
+        else:
+            faltando.append("--max-falhas-pct")
+    return faltando
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("estacoes", help=".txt com os códigos das estações")
@@ -723,12 +791,15 @@ def main(argv=None) -> int:
     ap.add_argument("--saida", default="saida")
     ap.add_argument("--refazer", action="store_true", help="baixa de novo mesmo que o XML já esteja salvo")
     ap.add_argument("--pausa", type=float, default=3.0, help="segundos entre downloads (padrão 3)")
-    ap.add_argument("--min-anos", type=float, default=20.0)
-    ap.add_argument("--max-falhas-pct", type=float, default=10.0)
-    ap.add_argument("--min-anos-mes", type=int, default=15)
+    ap.add_argument("--ano-inicial", "--ano-inicio", dest="ano_inicio", type=int,
+                    help="primeiro ano da janela de análise (se omitido, é perguntado no terminal)")
+    ap.add_argument("--ano-final", "--ano-fim", dest="ano_fim", type=int,
+                    help="último ano da janela de análise (se omitido, é perguntado no terminal)")
+    ap.add_argument("--min-anos", type=float,
+                    help="mínimo de anos de histórico, do 1º ao último mês com dado (se omitido, é perguntado)")
+    ap.add_argument("--max-falhas-pct", type=float,
+                    help="máximo de meses com falha, em %% (se omitido, é perguntado)")
     ap.add_argument("--max-falhas-dia", type=int, default=0)
-    ap.add_argument("--ano-inicio", type=int)
-    ap.add_argument("--ano-fim", type=int)
     ap.add_argument("--so-consistido", action="store_true")
     ap.add_argument("--preencher", choices=["regional", "nenhum"], default="regional")
     ap.add_argument("--ei-a", type=float, help="coeficiente a de EI = a*(p²/P)^b")
@@ -739,6 +810,16 @@ def main(argv=None) -> int:
         ap.error("--ei-a e --ei-b devem ser informados juntos")
     if a.fonte == "local" and not a.pasta:
         ap.error("--fonte local exige --pasta")
+    if a.min_anos is not None and a.min_anos <= 0:
+        ap.error("--min-anos deve ser maior que 0")
+    if a.max_falhas_pct is not None and not 0 <= a.max_falhas_pct <= 100:
+        ap.error("--max-falhas-pct deve estar entre 0 e 100")
+    if a.ano_inicio is not None and a.ano_fim is not None and a.ano_inicio > a.ano_fim:
+        ap.error("--ano-inicial não pode ser maior que --ano-final")
+    interativo = sys.stdin is not None and sys.stdin.isatty()
+    faltando = completar_parametros(a, interativo)
+    if faltando:
+        ap.error("informe " + " e ".join(faltando) + " (ou rode em um terminal interativo para ser perguntado)")
 
     saida = Path(a.saida)
     for sub in ("estacoes", "dados_brutos", "dados_diarios", "extraidos"):
@@ -748,7 +829,7 @@ def main(argv=None) -> int:
         handlers=[logging.StreamHandler(sys.stdout),
                   logging.FileHandler(saida / "log_execucao.txt", "w", encoding="utf-8")])
 
-    crit = Criterios(min_anos=a.min_anos, max_falhas_pct=a.max_falhas_pct, min_anos_mes=a.min_anos_mes,
+    crit = Criterios(min_anos=a.min_anos, max_falhas_pct=a.max_falhas_pct,
                      max_falhas_dia=a.max_falhas_dia, ano_inicio=a.ano_inicio, ano_fim=a.ano_fim,
                      so_consistido=a.so_consistido, preencher=a.preencher, ei_a=a.ei_a, ei_b=a.ei_b)
     codigos = ler_estacoes(Path(a.estacoes))
@@ -756,6 +837,8 @@ def main(argv=None) -> int:
         LOG.error("Nenhum código válido em %s", a.estacoes)
         return 1
     LOG.info("%d estações na lista; fonte: %s", len(codigos), a.fonte)
+    LOG.info("Parâmetros: janela de anos %s; mínimo de anos de histórico %g; máximo de meses com falha %g%%",
+             txt_janela_anos(crit), crit.min_anos, crit.max_falhas_pct)
 
     # 1) obtenção dos dados diários
     diarios: dict[int, pd.DataFrame] = {}

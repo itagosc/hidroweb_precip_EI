@@ -9,8 +9,15 @@ por estação aprovada.
 ```
 pip install pandas numpy xlsxwriter openpyxl requests
 
-python hidroweb_precip.py estacoes.txt --fonte ws --saida saida
+# o programa pergunta a janela de anos e os limites no terminal:
 python hidroweb_precip.py estacoes.txt --fonte local --pasta baixados --saida saida
+
+# ou tudo por opção (sem perguntas):
+python hidroweb_precip.py estacoes.txt --fonte local --pasta baixados --saida saida \
+    --ano-inicial 1991 --ano-final 2020 --min-anos 20 --max-falhas-pct 10
+
+# baixando do WebService da ANA (ver a seção sobre fontes):
+python hidroweb_precip.py estacoes.txt --fonte ws --saida saida --min-anos 20 --max-falhas-pct 10
 python testar_sintetico.py        # valida tudo com dados inventados
 ```
 
@@ -37,16 +44,23 @@ O portal em si (cliques no site) não é automatizado de propósito: não há ca
 - **Média mensal:** média do mês entre os anos em que ele é válido. **Média anual** = soma das 12 médias. Como conferência, a planilha traz também a média dos totais anuais (só anos com 12 meses).
 - Status 3 (duvidoso) e 4 (acumulado) são contados e informados, mas não eliminam nada.
 
-## Critérios eliminatórios (padrões, todos ajustáveis)
+## Janela de anos e critérios eliminatórios (definidos por você)
 
-| Critério | Padrão | Opção |
+Não há valores padrão: você informa a janela e os limites a cada execução, por opção ou, se omitir, o programa pergunta no terminal.
+
+| O que | Opção | No terminal |
 |---|---|---|
-| Existe ao menos 1 mês completo | — | — |
-| Anos de histórico (1º ao último mês com dado) | ≥ 20 | `--min-anos` |
-| Meses com falha dentro dessa janela | ≤ 10 % | `--max-falhas-pct` |
-| Anos válidos em **cada** mês do calendário | ≥ 15 | `--min-anos-mes` |
+| Janela de anos: ano inicial | `--ano-inicial` | Enter em branco = sem limite |
+| Janela de anos: ano final | `--ano-final` | Enter em branco = sem limite |
+| Anos de histórico (1º ao último mês com dado) ≥ N | `--min-anos` | obrigatório |
+| Meses com falha (%) ≤ N | `--max-falhas-pct` | obrigatório |
 
-Esses números são ponto de partida, não norma. Escolha-os conforme o seu método. `--ano-inicio` e `--ano-fim` recortam o período. Estações reprovadas ficam no `resumo_geral` com o motivo.
+Além desses dois limites, a estação precisa ter ao menos 1 mês completo.
+
+- **Janela de anos:** só os anos dentro dela entram em tudo (histórico, falhas, médias). O "histórico" e as "falhas" são medidos do primeiro ao último mês com dado **dentro da janela**.
+- **Sem terminal** (agendador, script): se faltar `--min-anos` ou `--max-falhas-pct`, o programa recusa e diz o que falta. A janela omitida vira "sem limite".
+- O critério "anos válidos em cada mês do calendário" foi **removido**. Atenção: sem ele, uma estação sem nenhum dado em algum mês do ano pode ser aprovada, e a média anual dela fica em branco (a soma das 12 médias exige os 12 meses).
+- A janela e os limites usados ficam gravados no log e na aba `Resumo` de cada planilha. Estações reprovadas ficam no `resumo_geral` com o motivo.
 
 ## Correção de meses sem dado (`--preencher regional`, padrão)
 
