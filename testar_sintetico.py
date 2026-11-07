@@ -92,8 +92,9 @@ def gerar():
                     valido = False
                 if (a, m) in c.get("acum", set()):
                     status = status.copy(); status[9] = 4.0
-                esp[(a, m)] = float(np.nansum(vals)) if valido else np.nan
-                regs.append(dict(cod=cod, nivel=2, ano=a, mes=m, vals=vals, status=status))
+                total = ver[(a, m)] if (not valido and cod == C and (a, m) in c.get("vazios", set())) else None
+                esp[(a, m)] = float(np.nansum(vals)) if valido else (total if total is not None else np.nan)
+                regs.append(dict(cod=cod, nivel=2, ano=a, mes=m, vals=vals, status=status, total=total))
         registros[cod], verdade[cod], esperado[cod] = regs, ver, esp
 
     # Estação A: duplicatas de nível 1 (bruto) em 2000 e mês consistido vazio em 06/1996
@@ -122,7 +123,7 @@ def csv_texto(regs) -> str:
         v = [("" if np.isnan(x) else f"{x:.1f}".replace(".", ",")) for x in r["vals"]] + [""] * (31 - nd)
         s = [("" if np.isnan(x) else str(int(x))) for x in r["status"]] + [""] * (31 - nd)
         out.append(";".join([f"{r['cod']:08d}", str(r["nivel"]), f"01/{r['mes']:02d}/{r['ano']}", "00:00:00",
-                             "", "", "9999,0", "", *v, *s]) + ";")
+                             "", "", ("" if r.get("total") is None else f"{r['total']:.1f}".replace(".", ",")), "", *v, *s]) + ";")
     return "\n".join(out) + "\n"
 
 
@@ -130,7 +131,7 @@ def xlsx_escrever(regs, caminho: Path) -> None:
     linhas = [["// SINTÉTICO"], ["// planilha de teste"], CAB]
     for r in regs:
         nd = len(r["vals"])
-        linhas.append([f"{r['cod']:08d}", r["nivel"], f"01/{r['mes']:02d}/{r['ano']}", "00:00:00", None, None, 9999.0, None,
+        linhas.append([f"{r['cod']:08d}", r["nivel"], f"01/{r['mes']:02d}/{r['ano']}", "00:00:00", None, None, r.get("total"), None,
                        *list(r["vals"]), *[None] * (31 - nd), *list(r["status"]), *[None] * (31 - nd)])
     pd.DataFrame(linhas).to_excel(caminho, header=False, index=False)
 
@@ -143,7 +144,7 @@ def xml_texto(regs) -> str:
         nd = len(r["vals"])
         out.append(f'<SerieHistorica diffgr:id="SerieHistorica{i + 1}" msdata:rowOrder="{i}">'
                    f"<EstacaoCodigo>{r['cod']:08d}</EstacaoCodigo><NivelConsistencia>{r['nivel']}</NivelConsistencia>"
-                   f"<DataHora>{r['ano']}-{r['mes']:02d}-01 00:00:00</DataHora><Total>9999</Total>")
+                   f"<DataHora>{r['ano']}-{r['mes']:02d}-01 00:00:00</DataHora><Total>{'' if r.get('total') is None else round(r['total'], 1)}</Total>")
         for d in range(nd):
             x, s = r["vals"][d], r["status"][d]
             out.append(f"<Chuva{d + 1:02d}>{'' if np.isnan(x) else x}</Chuva{d + 1:02d}>"
@@ -263,7 +264,11 @@ def main() -> int:
           "médias 'observadas' de B não usam valores preenchidos")
 
     print("\n[6] Tolerância de dias faltantes e filtro de nível")
-    dd = hp.carregar_local(pasta, RAIZ / "extr_tmp", {A, B})
+    dd = hp.carregar_local(pasta, RAIZ / "extr_tmp", {A, B, C})
+    rc = hp.processar_estacao(C, dd[C], hp.Criterios())
+    ok_c = all(abs(rc.mat.at[k[0], k[1]] - verdade[C][k]) < 0.06 for k in [(2019, 8), (1992, 6), (2001, 10)])
+    check(ok_c and rc.info["meses_do_arquivo"] == 5,
+          "nível 2 só com total (sem diário) usa o total do arquivo (5 meses)")
     crit = hp.Criterios(max_falhas_dia=3, preencher="nenhum")
     rb = hp.processar_estacao(B, dd[B], crit)
     check(pd.notna(rb.mat.at[2005, 9]) and pd.notna(rb.mat.at[2015, 2]), "com --max-falhas-dia 3, meses incompletos passam a valer")

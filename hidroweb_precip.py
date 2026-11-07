@@ -54,7 +54,7 @@ MESES = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "
 WS_URL = os.environ.get(
     "HIDROWEB_WS_URL", "https://telemetriaws1.ana.gov.br/ServiceANA.asmx/HidroSerieHistorica"
 )
-COLS_DIARIO = ["cod", "ano", "mes", "dia", "chuva", "status", "nivel"]
+COLS_DIARIO = ["cod", "ano", "mes", "dia", "chuva", "status", "nivel", "total_arq"]
 LOG = logging.getLogger("hidroweb")
 
 
@@ -144,6 +144,7 @@ def wide_para_diario(w: pd.DataFrame | None) -> pd.DataFrame:
     if not c_cod or not c_data:
         raise ValueError("colunas EstacaoCodigo/Data não encontradas")
     c_niv = low.get("nivelconsistencia")
+    c_tot = low.get("total")
 
     datas = _parse_data(w[c_data])
     base = pd.DataFrame(
@@ -157,6 +158,8 @@ def wide_para_diario(w: pd.DataFrame | None) -> pd.DataFrame:
     base = base[base.cod.notna() & base.ano.notna()].astype(
         {"cod": int, "ano": int, "mes": int, "nivel": int}
     )
+    # total mensal consolidado que vem no arquivo (usado quando não há leituras diárias)
+    base["total_arq"] = _num(w.loc[base.index, c_tot]) if c_tot else np.nan
 
     cols_val: dict[int, str] = {}
     cols_st: dict[int, str] = {}
@@ -325,10 +328,10 @@ def escolher_serie(d: pd.DataFrame, so_consistido: bool) -> pd.DataFrame:
         d = d[d.nivel == 2]
     if d.empty:
         return d
-    nv = (d.assign(ok=d.chuva.notna())
-            .groupby(["ano", "mes", "nivel"], as_index=False)["ok"].sum()
-            .rename(columns={"ok": "nv"}))
-    nv["tem"] = nv.nv > 0
+    nv = (d.assign(ok=d.chuva.notna(), tot=d.total_arq.notna())
+            .groupby(["ano", "mes", "nivel"], as_index=False)
+            .agg(nv=("ok", "sum"), tot=("tot", "max")))
+    nv["tem"] = (nv.nv > 0) | nv.tot.astype(bool)
     nv = nv.sort_values(["ano", "mes", "tem", "nivel", "nv"],
                         ascending=[True, True, False, False, False])
     melhor = nv.drop_duplicates(["ano", "mes"])[["ano", "mes", "nivel"]]
@@ -358,8 +361,9 @@ def processar_estacao(cod: int, diario: pd.DataFrame | None, crit: Criterios) ->
 
     ag = d.groupby(["ano", "mes"]).agg(
         dias_validos=("ok", "sum"), soma=("chuva", "sum"),
-        dias_acumulados=("acum", "sum"), dias_duvidosos=("duv", "sum"))
-    com_dado = ag[ag.dias_validos > 0]
+        dias_acumulados=("acum", "sum"), dias_duvidosos=("duv", "sum"),
+        tot_arq=("total_arq", "max"))
+    com_dado = ag[(ag.dias_validos > 0) | ag.tot_arq.notna()]
     pos_ok = com_dado.index.get_level_values("ano") * 12 + com_dado.index.get_level_values("mes") - 1
     ini, fim = int(pos_ok.min()), int(pos_ok.max())
 
@@ -367,12 +371,17 @@ def processar_estacao(cod: int, diario: pd.DataFrame | None, crit: Criterios) ->
                                      names=["ano", "mes"])
     m = ag.reindex(idx)
     presente = idx.isin(ag.index)
+    tot_arq = m.tot_arq
     m = m.fillna(0)
+    m["tot_arq"] = tot_arq
     m["dias_esperados"] = [calendar.monthrange(a, mm)[1] for a, mm in idx]
     pos = idx.get_level_values("ano") * 12 + idx.get_level_values("mes") - 1
     m["na_janela"] = np.asarray((pos >= ini) & (pos <= fim))
-    completo = (m.dias_validos >= m.dias_esperados - crit.max_falhas_dia) & (m.dias_validos > 0)
-    m["total"] = m.soma.where(completo)
+    dias_ok = (m.dias_validos >= m.dias_esperados - crit.max_falhas_dia) & (m.dias_validos > 0)
+    usa_arq = (~dias_ok) & m.tot_arq.notna()     # nível 2 só com total mensal, sem diário
+    completo = dias_ok | usa_arq
+    m["total"] = np.where(dias_ok, m.soma, np.where(usa_arq, m.tot_arq, np.nan)).astype(float)
+    m["do_arquivo"] = usa_arq
     motivos = []
     for pres, dv, esp, comp in zip(presente, m.dias_validos, m.dias_esperados, completo):
         if comp:
@@ -419,6 +428,7 @@ def processar_estacao(cod: int, diario: pd.DataFrame | None, crit: Criterios) ->
         "min_anos_mes": int(por_mes.min()),
         "dias_acumulados": int(m.dias_acumulados.sum()),
         "dias_duvidosos": int(m.dias_duvidosos.sum()),
+        "meses_do_arquivo": int((m.do_arquivo & m.na_janela).sum()),
     }
     return res
 
@@ -550,6 +560,7 @@ def escrever_planilha(res: Resultado, crit: Criterios, caminho: Path, fonte: str
         ("Dias com status 'acumulado' (4)", res.info["dias_acumulados"]),
         ("Dias com status 'duvidoso' (3)", res.info["dias_duvidosos"]),
         ("Tolerância de dias sem leitura por mês", crit.max_falhas_dia),
+        ("Meses com total consolidado do nível 2 (sem leituras diárias)", res.info["meses_do_arquivo"]),
     ]
     r = 2
     for k, v in linhas:

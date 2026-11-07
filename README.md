@@ -32,7 +32,7 @@ O portal em si (cliques no site) não é automatizado de propósito: não há ca
 ## O que o programa decide
 
 - **Modelo base de datas × do zero:** o programa monta sozinho o calendário completo (todos os anos × 12 meses) e marca o que falta. Não precisa de modelo pronto. Meses que nem aparecem no arquivo viram falha "mês ausente na fonte", em vez de sumirem sem aviso.
-- **Qual série usar em cada mês:** nível 2 (consistido); o nível 1 (bruto) só entra quando o consistido não tem nenhuma leitura. `--so-consistido` desliga o bruto.
+- **Qual série usar em cada mês:** nível 2 (consistido, definitivo) é sempre preferido. Se o mês de nível 2 não tem leituras diárias mas traz o total mensal consolidado, esse total é usado (e contado na aba Resumo). O nível 1 (bruto) só entra quando o consistido não tem nem leituras nem total. `--so-consistido` desliga o bruto.
 - **Mês válido:** todos os dias com leitura (`--max-falhas-dia N` tolera N dias sem leitura, mas o total então subestima).
 - **Média mensal:** média do mês entre os anos em que ele é válido. **Média anual** = soma das 12 médias. Como conferência, a planilha traz também a média dos totais anuais (só anos com 12 meses).
 - Status 3 (duvidoso) e 4 (acumulado) são contados e informados, mas não eliminam nada.
