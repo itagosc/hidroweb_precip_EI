@@ -244,7 +244,7 @@ def main() -> int:
     check(bad == 0, f"372 células mensais de A iguais ao esperado (divergentes: {bad})")
     check(sorted(wb.sheetnames) == ["Falhas", "Mensal", "Resumo"], f"abas: {wb.sheetnames}")
 
-    print("\n[5] Estação B: meses ausentes/vazios/incompletos e preenchimento regional")
+    print("\n[5] Estação B: meses ausentes/vazios/incompletos (sem estimativa)")
     wbB = load_workbook(out / "estacoes" / "02047001.xlsx", data_only=True)
     wf = wbB["Falhas"]
     linhas = [[c.value for c in row] for row in wf.iter_rows(min_row=2)]
@@ -257,16 +257,19 @@ def main() -> int:
     check("3 dias sem leitura" in pares[(2005, 9)][4], "mês com 3 dias faltando identificado")
     # mês com dia acumulado (status 4) não vira falha, só é contado
     check((2001, 6) not in pares, "mês com status 'acumulado' continua válido")
-    est = [l[5] for l in linhas]
-    check(all(isinstance(v, (int, float)) for v in est), "todos os 8 meses receberam valor estimado")
-    erros = [abs(l[5] - verdade[B][k]) / verdade[B][k] for k, l in pares.items() if isinstance(l[5], (int, float))]
-    print(f"       erro relativo do preenchimento: mediana {np.median(erros):.1%}, máx {np.max(erros):.1%}")
-    check(np.median(erros) < 0.25, "mediana do erro relativo do preenchimento < 25% (dados sintéticos bem correlacionados)")
+    check(wf.max_column == 5, "aba Falhas sem coluna de valor estimado")
+    todos = [str(c.value) for s in wbB.worksheets for row in s.iter_rows() for c in row if c.value is not None]
+    check(not any("preench" in t.lower() or "valor estimado" in t.lower() for t in todos),
+          "planilha não menciona preenchimento nem valor estimado")
     linhaB = res[res["Código"] == "02047001"].iloc[0]
-    check(int(linhaB["Meses preenchidos"]) == 8, "resumo informa 8 meses preenchidos")
+    check(int(linhaB["Meses com falha"]) == 8, "resumo informa 8 meses com falha")
+    check("Meses preenchidos" not in res.columns, "resumo_geral sem a coluna 'Meses preenchidos'")
     ex_obs = esperado_df(esperado[B]).mean(axis=0)
     check(all(abs(linhaB[f"P_{hp.MESES[i]} (mm)"] - ex_obs[i + 1]) < 0.006 for i in range(12)),
-          "médias 'observadas' de B não usam valores preenchidos")
+          "médias de B só com meses completos (as 8 falhas ficam de fora)")
+    r = rodar([str(est_txt), "--fonte", "local", "--pasta", str(pasta), "--saida", str(RAIZ / "out_x"),
+               "--preencher", "nenhum"])
+    check(r.returncode == 2, "a opção --preencher não existe mais")
 
     print("\n[6] Tolerância de dias faltantes e filtro de nível")
     dd = hp.carregar_local(pasta, RAIZ / "extr_tmp", {A, B, C})
@@ -274,7 +277,7 @@ def main() -> int:
     ok_c = all(abs(rc.mat.at[k[0], k[1]] - verdade[C][k]) < 0.06 for k in [(2019, 8), (1992, 6), (2001, 10)])
     check(ok_c and rc.info["meses_do_arquivo"] == 5,
           "nível 2 só com total (sem diário) usa o total do arquivo (5 meses)")
-    crit = hp.Criterios(max_falhas_dia=3, preencher="nenhum")
+    crit = hp.Criterios(max_falhas_dia=3)
     rb = hp.processar_estacao(B, dd[B], crit)
     check(pd.notna(rb.mat.at[2005, 9]) and pd.notna(rb.mat.at[2015, 2]), "com --max-falhas-dia 3, meses incompletos passam a valer")
     ra = hp.processar_estacao(A, dd[A], hp.Criterios(so_consistido=True))
@@ -350,8 +353,7 @@ def main() -> int:
 
     print("\n[10] Janela de anos, limites definidos pelo usuário e critério por mês removido")
     r = rodar([str(est_txt), "--fonte", "local", "--pasta", str(pasta), "--saida", str(RAIZ / "out_win"),
-               "--ano-inicial", "2000", "--ano-final", "2010", "--min-anos", "10", "--max-falhas-pct", "10",
-               "--preencher", "nenhum"], criterios=False)
+               "--ano-inicial", "2000", "--ano-final", "2010", "--min-anos", "10", "--max-falhas-pct", "10"], criterios=False)
     check(r.returncode == 0, f"execução com janela 2000–2010 terminou (stderr: {r.stderr[-300:]!r})")
     rj = pd.read_csv(RAIZ / "out_win" / "resumo_geral.csv", sep=";", decimal=",", encoding="utf-8-sig",
                      dtype={"Código": str})

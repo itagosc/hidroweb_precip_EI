@@ -24,10 +24,9 @@ Fluxo
    % de meses com falha). A janela de anos (ano inicial a final) e os limites
    dos dois últimos critérios são definidos pelo usuário: por opção na linha de
    comando ou, se omitidos, perguntados no terminal.
-6. Opcionalmente preenche meses faltantes por ponderação regional, usando as
-   outras estações da própria lista como doadoras (valores preenchidos são
-   sempre sinalizados e nunca entram nas médias "observadas").
-7. Grava uma planilha .xlsx por estação aprovada + resumo_geral.xlsx/.csv.
+6. Grava uma planilha .xlsx por estação aprovada + resumo_geral.xlsx/.csv.
+   Meses sem dado ficam em branco e listados na aba Falhas; nenhum valor é
+   estimado e as médias usam apenas meses completos.
 
 Uso
 ---
@@ -74,7 +73,6 @@ class Criterios:
     ano_inicio: int | None = None
     ano_fim: int | None = None
     so_consistido: bool = False     # True = ignora dados brutos (nível 1)
-    preencher: str = "regional"     # 'regional' | 'nenhum'
     ei_a: float | None = None       # EI = a * (p^2/P)^b  (coeficientes regionais)
     ei_b: float | None = None
 
@@ -88,8 +86,6 @@ class Resultado:
     mensal: pd.DataFrame | None = None   # índice (ano, mes)
     mat: pd.DataFrame | None = None      # anos x 1..12, totais observados
     janela: pd.DataFrame | None = None   # anos x 1..12, bool (dentro da janela)
-    mat_fill: pd.DataFrame | None = None
-    flag_fill: pd.DataFrame | None = None
     criterios: list = field(default_factory=list)
     info: dict = field(default_factory=dict)
 
@@ -467,54 +463,6 @@ def indices_erosividade(est: dict, crit: Criterios) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Correção: preenchimento por ponderação regional
-# --------------------------------------------------------------------------- #
-def preencher_regional(cod_alvo: int, mats: dict[int, pd.DataFrame], janelas: dict[int, pd.DataFrame],
-                       r_min: float = 0.7, min_sobrep: int = 10, n_max: int = 3,
-                       min_doadores: int = 2) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Px = média( (Mx/Mi) * Pi ) sobre até n_max doadoras com r >= r_min no mesmo mês."""
-    anos = sorted(set().union(*[set(m.index) for m in mats.values()]))
-    base = {c: m.reindex(anos) for c, m in mats.items()}
-    alvo = base[cod_alvo]
-    mask = janelas[cod_alvo].reindex(anos).fillna(False).astype(bool)
-    F = alvo.copy()
-    flag = pd.DataFrame(False, index=anos, columns=alvo.columns)
-    for mes in alvo.columns:
-        x = alvo[mes]
-        cands = []
-        for c2, M2 in base.items():
-            if c2 == cod_alvo:
-                continue
-            y = M2[mes]
-            ov = x.notna() & y.notna()
-            if int(ov.sum()) < min_sobrep:
-                continue
-            xo, yo = x[ov].to_numpy(float), y[ov].to_numpy(float)
-            if xo.std() == 0 or yo.std() == 0 or yo.mean() <= 0:
-                continue
-            r = float(np.corrcoef(xo, yo)[0, 1])
-            if r >= r_min:
-                cands.append((r, c2, float(xo.mean() / yo.mean())))
-        cands.sort(reverse=True)
-        if len(cands) < min_doadores:
-            continue
-        faltam = x.index[(x.isna() & mask[mes]).to_numpy()]
-        for ano in faltam:
-            est = []
-            for _, c2, razao in cands:
-                v = base[c2].at[ano, mes]
-                if pd.notna(v):
-                    est.append(razao * float(v))
-                if len(est) == n_max:
-                    break
-            if len(est) >= min_doadores:
-                F.at[ano, mes] = float(np.mean(est))
-                flag.at[ano, mes] = True
-    anos_alvo = mats[cod_alvo].index
-    return F.loc[anos_alvo], flag.loc[anos_alvo]
-
-
-# --------------------------------------------------------------------------- #
 # Saída
 # --------------------------------------------------------------------------- #
 def _w(ws, r, c, v, f=None):
@@ -543,16 +491,12 @@ def escrever_planilha(res: Resultado, crit: Criterios, caminho: Path, fonte: str
         "bold": wb.add_format({"bold": True, "border": 1, "num_format": "0.0", "bg_color": "#F2F2F2"}),
         "boldt": wb.add_format({"bold": True, "border": 1, "bg_color": "#F2F2F2"}),
         "falha": wb.add_format({"border": 1, "bg_color": "#FFE699"}),
-        "fill": wb.add_format({"border": 1, "num_format": "0.0", "bg_color": "#9BC2E6"}),
         "fora": wb.add_format({"border": 1, "bg_color": "#EDEDED"}),
         "ok": wb.add_format({"border": 1, "font_color": "#1E6B2E", "bold": True}),
         "ruim": wb.add_format({"border": 1, "font_color": "#B00020", "bold": True}),
     }
     est = estatisticas(res.mat)
     ind = indices_erosividade(est, crit)
-    tem_fill = res.mat_fill is not None
-    est_f = estatisticas(res.mat_fill) if tem_fill else None
-    mostrar = res.mat_fill if tem_fill else res.mat
 
     # ---------------- Resumo ----------------
     ws = wb.add_worksheet("Resumo")
@@ -586,8 +530,6 @@ def escrever_planilha(res: Resultado, crit: Criterios, caminho: Path, fonte: str
         r += 1
     r += 1
     cab = ["Mês", "Média observada (mm)", "N anos (observados)", "Desvio padrão (mm)"]
-    if tem_fill:
-        cab.append("Média c/ preenchimento (mm)")
     cab.append("Coef. Fournier p²/P (mm)")
     if ind["ei"] is not None:
         cab.append("EI mensal (unid. do coef. informado)")
@@ -601,8 +543,6 @@ def escrever_planilha(res: Resultado, crit: Criterios, caminho: Path, fonte: str
         _w(ws, r, c, est["med"][mes], F["n1"]); c += 1
         _w(ws, r, c, int(est["n"][mes]), F["int"]); c += 1
         _w(ws, r, c, est["dp"][mes], F["n1"]); c += 1
-        if tem_fill:
-            _w(ws, r, c, est_f["med"][mes], F["n1"]); c += 1
         _w(ws, r, c, ind["c"][mes], F["n1"]); c += 1
         if ind["ei"] is not None:
             _w(ws, r, c, ind["ei"][mes], F["n1"])
@@ -612,8 +552,6 @@ def escrever_planilha(res: Resultado, crit: Criterios, caminho: Path, fonte: str
     _w(ws, r, c, est["anual"], F["bold"]); c += 1
     ws.write_blank(r, c, None, F["boldt"]); c += 1
     ws.write_blank(r, c, None, F["boldt"]); c += 1
-    if tem_fill:
-        _w(ws, r, c, est_f["anual"], F["bold"]); c += 1
     _w(ws, r, c, ind["ifm"], F["bold"]); c += 1
     if ind["ei"] is not None:
         _w(ws, r, c, ind["R"], F["bold"])
@@ -622,7 +560,7 @@ def escrever_planilha(res: Resultado, crit: Criterios, caminho: Path, fonte: str
     _w(ws, r, 1, est["anual_xcheck"], F["n1"])
     r += 2
     notas = [
-        "Médias observadas usam só meses completos com leitura real; meses preenchidos nunca entram nelas.",
+        "As médias usam só meses completos; meses com falha ficam de fora (nenhum valor é estimado).",
         "Coef. Fournier mensal = p²/P (p = média do mês; P = média anual). Coluna 'ANUAL' dessa coluna = Índice de Fournier modificado.",
     ]
     if ind["ei"] is not None:
@@ -646,42 +584,34 @@ def escrever_planilha(res: Resultado, crit: Criterios, caminho: Path, fonte: str
             obs = res.mat.at[ano, mes]
             if pd.notna(obs):
                 wm.write_number(rr, mes, float(obs), F["n1"])
-            elif tem_fill and bool(res.flag_fill.at[ano, mes]):
-                wm.write_number(rr, mes, float(mostrar.at[ano, mes]), F["fill"])
             elif bool(res.janela.at[ano, mes]):
                 wm.write_blank(rr, mes, None, F["falha"])
             else:
                 wm.write_blank(rr, mes, None, F["fora"])
-        linha = mostrar.loc[ano]
+        linha = res.mat.loc[ano]
         _w(wm, rr, 13, float(linha.sum()) if linha.notna().all() else np.nan, F["n1"])
         wm.write_number(rr, 14, int(res.mat.loc[ano].notna().sum()), F["int"])
     rr = len(res.mat) + 2
     stats = [("Média (observado)", est["med"], "bold"), ("N anos (observado)", est["n"], "int"),
              ("Desvio padrão", est["dp"], "n1")]
-    if tem_fill:
-        stats.append(("Média (c/ preenchimento)", est_f["med"], "bold"))
     for nome, serie, f in stats:
         wm.write(rr, 0, nome, F["boldt"])
         for mes in range(1, 13):
             _w(wm, rr, mes, serie[mes], F[f])
         if nome == "Média (observado)":
             _w(wm, rr, 13, est["anual"], F["bold"])
-        if nome == "Média (c/ preenchimento)":
-            _w(wm, rr, 13, est_f["anual"], F["bold"])
         rr += 1
     rr += 1
     wm.write(rr, 0, "Legenda:")
     wm.write(rr, 1, "falha", F["falha"])
-    wm.write(rr, 2, "preench.", F["fill"])
-    wm.write(rr, 3, "fora da janela", F["fora"])
+    wm.write(rr, 2, "fora da janela", F["fora"])
 
     # ---------------- Falhas ----------------
     wf = wb.add_worksheet("Falhas")
     wf.set_column(0, 1, 8)
     wf.set_column(2, 3, 14)
     wf.set_column(4, 4, 28)
-    wf.set_column(5, 5, 22)
-    wf.write_row(0, 0, ["Ano", "Mês", "Dias com leitura", "Dias no mês", "Motivo", "Valor estimado (mm)"], F["cab"])
+    wf.write_row(0, 0, ["Ano", "Mês", "Dias com leitura", "Dias no mês", "Motivo"], F["cab"])
     falhas = res.mensal[res.mensal.na_janela & res.mensal.total.isna()]
     for i, ((ano, mes), row) in enumerate(falhas.iterrows(), start=1):
         wf.write_number(i, 0, int(ano), F["int"])
@@ -689,10 +619,6 @@ def escrever_planilha(res: Resultado, crit: Criterios, caminho: Path, fonte: str
         wf.write_number(i, 2, int(row.dias_validos), F["int"])
         wf.write_number(i, 3, int(row.dias_esperados), F["int"])
         wf.write(i, 4, row.motivo, F["txt"])
-        if tem_fill and bool(res.flag_fill.at[ano, mes]):
-            wf.write_number(i, 5, float(res.mat_fill.at[ano, mes]), F["fill"])
-        else:
-            wf.write(i, 5, "não preenchido", F["txt"])
     wb.close()
 
 
@@ -714,8 +640,6 @@ def linha_resumo(res: Resultado, crit: Criterios) -> dict:
     row["IFM Fournier modificado (mm)"] = round(ind["ifm"], 2) if pd.notna(ind["ifm"]) else np.nan
     if ind["ei"] is not None:
         row["R (soma dos EI)"] = round(ind["R"], 2)
-    if res.flag_fill is not None:
-        row["Meses preenchidos"] = int(res.flag_fill.to_numpy().sum())
     return row
 
 
@@ -801,7 +725,6 @@ def main(argv=None) -> int:
                     help="máximo de meses com falha, em %% (se omitido, é perguntado)")
     ap.add_argument("--max-falhas-dia", type=int, default=0)
     ap.add_argument("--so-consistido", action="store_true")
-    ap.add_argument("--preencher", choices=["regional", "nenhum"], default="regional")
     ap.add_argument("--ei-a", type=float, help="coeficiente a de EI = a*(p²/P)^b")
     ap.add_argument("--ei-b", type=float, help="expoente b de EI = a*(p²/P)^b")
     a = ap.parse_args(argv)
@@ -831,7 +754,7 @@ def main(argv=None) -> int:
 
     crit = Criterios(min_anos=a.min_anos, max_falhas_pct=a.max_falhas_pct,
                      max_falhas_dia=a.max_falhas_dia, ano_inicio=a.ano_inicio, ano_fim=a.ano_fim,
-                     so_consistido=a.so_consistido, preencher=a.preencher, ei_a=a.ei_a, ei_b=a.ei_b)
+                     so_consistido=a.so_consistido, ei_a=a.ei_a, ei_b=a.ei_b)
     codigos = ler_estacoes(Path(a.estacoes))
     if not codigos:
         LOG.error("Nenhum código válido em %s", a.estacoes)
@@ -873,22 +796,10 @@ def main(argv=None) -> int:
         resultados[cod] = r
         LOG.info("Estação %s: %s%s", fmt(cod), r.situacao, f" — {'; '.join(r.motivos)}" if r.motivos else "")
 
-    # 3) preenchimento regional (alvo = aprovadas; doadoras = todas com dados)
     com_mat = {c: r for c, r in resultados.items() if r.mat is not None}
     aprovadas = [c for c, r in com_mat.items() if r.situacao == "Aprovada"]
-    if crit.preencher == "regional":
-        if len(com_mat) >= 3:
-            mats = {c: r.mat for c, r in com_mat.items()}
-            jans = {c: r.janela for c, r in com_mat.items()}
-            for c in aprovadas:
-                F, fl = preencher_regional(c, mats, jans)
-                if fl.to_numpy().any():
-                    resultados[c].mat_fill, resultados[c].flag_fill = F, fl
-                    LOG.info("Estação %s: %d meses preenchidos", fmt(c), int(fl.to_numpy().sum()))
-        else:
-            LOG.info("Preenchimento regional ignorado: precisa de ≥ 3 estações com dados na lista.")
 
-    # 4) saídas
+    # 3) saídas
     for c in aprovadas:
         escrever_planilha(resultados[c], crit, saida / "estacoes" / f"{fmt(c)}.xlsx",
                           "WebService ANA" if a.fonte == "ws" else f"arquivos locais (pasta '{Path(a.pasta).name}')")

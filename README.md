@@ -62,11 +62,9 @@ Além desses dois limites, a estação precisa ter ao menos 1 mês completo.
 - O critério "anos válidos em cada mês do calendário" foi **removido**. Atenção: sem ele, uma estação sem nenhum dado em algum mês do ano pode ser aprovada, e a média anual dela fica em branco (a soma das 12 médias exige os 12 meses).
 - A janela e os limites usados ficam gravados no log e na aba `Resumo` de cada planilha. Estações reprovadas ficam no `resumo_geral` com o motivo.
 
-## Correção de meses sem dado (`--preencher regional`, padrão)
+## Meses sem dado
 
-Ponderação regional: `Px = média[(Mx/Mi)·Pi]`, com até 3 estações doadoras **da própria lista**, escolhidas por correlação (r ≥ 0,7 no mesmo mês, ≥ 10 anos em comum), exigindo ≥ 2 doadoras com valor naquele mês. Só preenche dentro da janela da estação e só em estações aprovadas. Precisa de ≥ 3 estações com dados na lista. `--preencher nenhum` desliga.
-
-Valores preenchidos aparecem em azul, listados na aba `Falhas`, e **nunca entram nas médias "observadas"**. A coluna "com preenchimento" existe só para comparação. Doadoras distantes ou de clima diferente deveriam ser evitadas: use uma lista de estações da mesma região.
+O programa **não estima** meses faltantes. Eles ficam em branco (amarelo) na aba `Mensal`, são listados na aba `Falhas` com o motivo (mês ausente na fonte, sem leituras no mês, N dias sem leitura), entram na contagem de "meses com falha" do critério eliminatório e ficam de fora das médias.
 
 ## Fournier, EI e fator R
 
@@ -86,4 +84,4 @@ Esses valores são só o formato do exemplo. Os coeficientes são regionais e v�
 
 ## Validação feita
 
-`testar_sintetico.py` gera 6 estações inventadas (csv latin-1, xlsx, zip dentro de zip, zip inválido, XML, duplicatas de nível, meses ausentes/vazios/incompletos) e confere: lista de estações, aprovação/reprovação, 372 células mensais contra valores calculados à parte, médias, tolerância de dias, preenchimento (erro mediano ≈ 6 % nos dados sintéticos), retentativa após erro 503, cache e R. Isso prova a lógica, **não** o comportamento com os arquivos reais da ANA.
+`testar_sintetico.py` gera 6 estações inventadas (csv latin-1, xlsx, zip dentro de zip, zip inválido, XML, duplicatas de nível, meses ausentes/vazios/incompletos) e confere: lista de estações, aprovação/reprovação, 372 células mensais contra valores calculados à parte, médias, tolerância de dias, retentativa após erro 503, cache e R. Isso prova a lógica, **não** o comportamento com os arquivos reais da ANA.
