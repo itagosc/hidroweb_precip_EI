@@ -14,6 +14,9 @@ Fluxo
 2. Obtém os dados diários de chuva:
      --fonte ws     baixa do WebService público da ANA (HidroSerieHistorica),
                     com retentativas e espera crescente;
+     --fonte api    baixa da API HidroWebService da ANA (HidroSerieChuva v1), uma
+                    requisição por ano (limite de 366 dias da API). Exige o token
+                    JWT na variável de ambiente HIDROWEB_TOKEN (ou pedido sem eco);
      --fonte local  lê arquivos já baixados do portal Hidroweb (.zip, .csv,
                     .txt, .xlsx) em --pasta; zips são descompactados.
 3. Escolhe, mês a mês, a melhor série (nível 2 = consistido; nível 1 = bruto
@@ -38,8 +41,10 @@ Uso
 from __future__ import annotations
 
 import argparse
+import base64
 import calendar
 import io
+import json
 import logging
 import os
 import re
@@ -47,6 +52,7 @@ import sys
 import time
 import zipfile
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -56,6 +62,9 @@ import pandas as pd
 MESES = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
 WS_URL = os.environ.get(
     "HIDROWEB_WS_URL", "https://telemetriaws1.ana.gov.br/ServiceANA.asmx/HidroSerieHistorica"
+)
+API_URL = os.environ.get(
+    "HIDROWEB_API_URL", "https://www.ana.gov.br/hidrowebservice/EstacoesTelemetricas/HidroSerieChuva/v1"
 )
 COLS_DIARIO = ["cod", "ano", "mes", "dia", "chuva", "status", "nivel", "total_arq"]
 LOG = logging.getLogger("hidroweb")
@@ -239,6 +248,122 @@ def xml_para_largo(conteudo: bytes, cod: int) -> pd.DataFrame:
     w["EstacaoCodigo"] = cod
     if "Data" not in w.columns and "DataHora" in w.columns:
         w["Data"] = w["DataHora"]
+    return w
+
+
+# --------------------------------------------------------------------------- #
+# Fonte 3: API HidroWebService da ANA (JSON, exige token JWT)
+# --------------------------------------------------------------------------- #
+class ErroToken(RuntimeError):
+    """Token ausente, expirado ou recusado: interrompe a execução inteira."""
+
+
+def expiracao_jwt(token: str):
+    """Data de expiração (UTC) lida do próprio JWT, ou None se não der para ler."""
+    try:
+        p = token.split(".")[1]
+        p += "=" * (-len(p) % 4)
+        return datetime.fromtimestamp(json.loads(base64.urlsafe_b64decode(p))["exp"], timezone.utc)
+    except Exception:
+        return None
+
+
+def obter_token(interativo: bool) -> str:
+    """Lê o token de HIDROWEB_TOKEN (ou pede sem eco no terminal). Nunca por opção de linha
+    de comando (ficaria no histórico) e nunca é gravado em arquivo nem no log."""
+    tok = os.environ.get("HIDROWEB_TOKEN", "").strip()
+    if not tok:
+        if not interativo:
+            raise ErroToken("token ausente: defina a variável de ambiente HIDROWEB_TOKEN "
+                            "com o tokenautenticacao")
+        import getpass
+        tok = getpass.getpass("Cole o tokenautenticacao (não aparece na tela): ").strip()
+        if not tok:
+            raise ErroToken("token ausente")
+    if tok.lower().startswith("bearer "):
+        tok = tok[7:].strip()
+    exp = expiracao_jwt(tok)
+    if exp is not None:
+        restante = (exp - datetime.now(timezone.utc)).total_seconds() / 60
+        if restante <= 0:
+            raise ErroToken(f"token expirado em {exp.astimezone():%d/%m/%Y %H:%M}; gere outro")
+        if restante < 10:
+            LOG.warning("O token expira em %.0f min; a execução pode ser interrompida.", restante)
+    return tok
+
+
+def _url_api(cod: int, ini: str, fim: str) -> str:
+    from urllib.parse import quote
+    par = [("Código da Estação", str(cod)), ("Tipo Filtro Data", "DATA_LEITURA"),
+           ("Data Inicial (yyyy-MM-dd)", ini), ("Data Final (yyyy-MM-dd)", fim)]
+    return API_URL + "?" + "&".join(f"{quote(k, safe='()')}={quote(v, safe='')}" for k, v in par)
+
+
+def _pedir_api(url: str, token: str, tentativas: int = 5) -> list:
+    import requests
+    cab = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+           "User-Agent": "hidroweb-precip/1.0"}
+    espera, ultimo = 1.0, ""
+    for t in range(1, tentativas + 1):
+        try:
+            r = requests.get(url, headers=cab, timeout=120)
+        except requests.RequestException as e:
+            ultimo = str(e)
+        else:
+            try:
+                corpo = r.json()
+            except ValueError:
+                corpo = None
+            if not isinstance(corpo, dict):
+                ultimo = f"resposta que não é JSON (HTTP {r.status_code})"
+            else:
+                codigo, msg = corpo.get("code", r.status_code), corpo.get("message", "")
+                if codigo == 200:
+                    itens = corpo.get("items")
+                    return [itens] if isinstance(itens, dict) else (itens or [])
+                if codigo in (401, 403):
+                    raise ErroToken(f"a API recusou o token (código {codigo}: {msg}); gere outro token")
+                if codigo == 404:
+                    return []                       # sem dados no período
+                if codigo not in (429, 500, 502, 503, 504):
+                    raise RuntimeError(f"API respondeu {codigo}: {msg}")
+                ultimo = f"código {codigo}"
+        LOG.warning("API: tentativa %d/%d falhou (%s); aguardando %.0fs", t, tentativas, ultimo,
+                    min(60.0, espera))
+        time.sleep(min(60.0, espera))
+        espera *= 2
+    raise RuntimeError(f"API indisponível após {tentativas} tentativas ({ultimo})")
+
+
+def baixar_api(cod: int, ano_ini: int, ano_fim: int, pasta_bruto: Path, token: str,
+               refazer: bool, pausa: float) -> list:
+    """Uma requisição por ano (a API recusa intervalos acima de 366 dias). Guarda o JSON
+    (só dados, sem token) para reaproveitar nas próximas execuções."""
+    destino = pasta_bruto / f"{fmt(cod)}_api_{ano_ini}_{ano_fim}.json"
+    if destino.exists() and not refazer:
+        return json.loads(destino.read_text(encoding="utf-8"))
+    itens: list = []
+    for ano in range(ano_ini, ano_fim + 1):
+        itens += _pedir_api(_url_api(cod, f"{ano}-01-01", f"{ano}-12-31"), token)
+        time.sleep(pausa)
+    destino.write_text(json.dumps(itens, ensure_ascii=False), encoding="utf-8")
+    return itens
+
+
+def itens_para_largo(itens: list, cod: int) -> pd.DataFrame:
+    """JSON da API (Chuva_01, Chuva_01_Status, Data_Hora_Dado, Nivel_Consistencia, Total)
+    para o formato de uma linha por mês que wide_para_diario já entende."""
+    if not itens:
+        return pd.DataFrame()
+    w = pd.DataFrame(itens)
+    ren = {}
+    for c in w.columns:
+        m = re.fullmatch(r"chuva_(\d{2})(_status)?", str(c).lower())
+        if m:
+            ren[c] = f"Chuva{m.group(1)}" + ("Status" if m.group(2) else "")
+    w = w.rename(columns=ren).rename(columns={"Data_Hora_Dado": "Data",
+                                              "Nivel_Consistencia": "NivelConsistencia"})
+    w["EstacaoCodigo"] = cod
     return w
 
 
@@ -710,11 +835,12 @@ def completar_parametros(a, interativo: bool, entrada=input) -> list[str]:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("estacoes", help=".txt com os códigos das estações")
-    ap.add_argument("--fonte", choices=["ws", "local"], default="ws")
+    ap.add_argument("--fonte", choices=["ws", "api", "local"], default="ws")
     ap.add_argument("--pasta", help="pasta com .zip/.csv/.txt/.xlsx baixados do Hidroweb (--fonte local)")
     ap.add_argument("--saida", default="saida")
     ap.add_argument("--refazer", action="store_true", help="baixa de novo mesmo que o XML já esteja salvo")
-    ap.add_argument("--pausa", type=float, default=3.0, help="segundos entre downloads (padrão 3)")
+    ap.add_argument("--pausa", type=float, default=None,
+                    help="segundos entre downloads (padrão: 3 no ws; 0,5 por requisição na api)")
     ap.add_argument("--ano-inicial", "--ano-inicio", dest="ano_inicio", type=int,
                     help="primeiro ano da janela de análise (se omitido, é perguntado no terminal)")
     ap.add_argument("--ano-final", "--ano-fim", dest="ano_fim", type=int,
@@ -768,6 +894,29 @@ def main(argv=None) -> int:
     erros: dict[int, str] = {}
     if a.fonte == "local":
         diarios = carregar_local(Path(a.pasta), saida / "extraidos", set(codigos))
+    elif a.fonte == "api":
+        try:
+            token = obter_token(interativo)
+        except ErroToken as e:
+            LOG.error("%s", e)
+            return 1
+        ano_i = a.ano_inicio if a.ano_inicio is not None else 1900
+        ano_f = a.ano_fim if a.ano_fim is not None else datetime.now().year
+        if a.ano_inicio is None:
+            LOG.warning("Sem ano inicial: buscando desde %d (uma requisição por ano, por estação). "
+                        "Informe a janela de anos para acelerar.", ano_i)
+        pausa = a.pausa if a.pausa is not None else 0.5
+        for cod in codigos:
+            try:
+                itens = baixar_api(cod, ano_i, ano_f, saida / "dados_brutos", token, a.refazer, pausa)
+                diarios[cod] = wide_para_diario(itens_para_largo(itens, cod))
+                LOG.info("Estação %s: %d leituras diárias", fmt(cod), len(diarios[cod]))
+            except ErroToken as e:
+                LOG.error("%s", e)
+                return 1
+            except Exception as e:
+                erros[cod] = str(e)
+                LOG.error("Estação %s: %s", fmt(cod), e)
     else:
         for cod in codigos:
             try:
@@ -775,7 +924,7 @@ def main(argv=None) -> int:
                 diarios[cod] = wide_para_diario(xml_para_largo(conteudo, cod))
                 LOG.info("Estação %s: %d leituras diárias", fmt(cod), len(diarios[cod]))
                 if da_rede:
-                    time.sleep(a.pausa)
+                    time.sleep(a.pausa if a.pausa is not None else 3.0)
             except Exception as e:
                 erros[cod] = str(e)
                 LOG.error("Estação %s: %s", fmt(cod), e)
@@ -800,9 +949,14 @@ def main(argv=None) -> int:
     aprovadas = [c for c, r in com_mat.items() if r.situacao == "Aprovada"]
 
     # 3) saídas
+    if a.fonte == "ws":
+        fonte_txt = "WebService ANA"
+    elif a.fonte == "api":
+        fonte_txt = "API HidroWebService (ANA)"
+    else:
+        fonte_txt = f"arquivos locais (pasta '{Path(a.pasta).name}')"
     for c in aprovadas:
-        escrever_planilha(resultados[c], crit, saida / "estacoes" / f"{fmt(c)}.xlsx",
-                          "WebService ANA" if a.fonte == "ws" else f"arquivos locais (pasta '{Path(a.pasta).name}')")
+        escrever_planilha(resultados[c], crit, saida / "estacoes" / f"{fmt(c)}.xlsx", fonte_txt)
     for c, r in com_mat.items():
         r.diario.to_csv(saida / "dados_diarios" / f"{fmt(c)}.csv", index=False)
     resumo = pd.DataFrame([linha_resumo(resultados[c], crit) for c in codigos])

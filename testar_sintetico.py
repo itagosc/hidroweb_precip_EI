@@ -158,6 +158,38 @@ XML_VAZIO = ('<?xml version="1.0" encoding="utf-8"?><DataSet xmlns="http://MRCS/
              'xmlns:diffgr="urn:schemas-microsoft-com:xml-diffgram-v1"/></DataSet>')
 
 
+def itens_api(regs):
+    """Itens no formato JSON da API HidroSerieChuva v1 (Chuva_01, Chuva_01_Status, ...)."""
+    out = []
+    for r in regs:
+        nd = len(r["vals"])
+        it = {}
+        for d in range(1, 32):
+            if d <= nd and not np.isnan(r["vals"][d - 1]):
+                it[f"Chuva_{d:02d}"] = f"{r['vals'][d - 1]:.1f}"
+                it[f"Chuva_{d:02d}_Status"] = "0" if np.isnan(r["status"][d - 1]) else str(int(r["status"][d - 1]))
+            else:
+                it[f"Chuva_{d:02d}"] = None
+                it[f"Chuva_{d:02d}_Status"] = "0"
+        it.update({"Data_Hora_Dado": f"{r['ano']}-{r['mes']:02d}-01 00:00:00.0",
+                   "Nivel_Consistencia": str(r["nivel"]),
+                   "Total": None if r.get("total") is None else f"{r['total']:.1f}",
+                   "codigoestacao": str(r["cod"])})
+        out.append(it)
+    return out
+
+
+def montar_jwt(exp: int) -> str:
+    import base64, json
+    b = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()  # noqa: E731
+    return f"{b({'alg': 'HS512'})}.{b({'exp': exp, 'iat': exp - 3600})}.assinatura-falsa"
+
+
+# Janeiro/2020 da estação 1646001 exatamente como a API real devolveu (colado pelo usuário em 09/11/2026)
+REAL_JAN2020 = [0.6, 0.0, 14.2, 29.8, 25.5, 2.0, 0.0, 7.2, 0.0, 0.0, 1.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9,
+                0.0, 0.0, 4.0, 70.0, 53.4, 21.7, 14.1, 49.5, 5.3, 10.3, 11.5, 3.8, 0.0]
+
+
 def rodar(args: list[str], env=None, criterios: bool = True) -> subprocess.CompletedProcess:
     """Executa o programa sem terminal (stdin fechado). Os limites agora vêm do usuário:
     se o teste não os informa, usa 20 anos e 10 %."""
@@ -404,6 +436,100 @@ def main() -> int:
         raise AssertionError("não deveria perguntar")
     check(hp.completar_parametros(a, True, entrada=_nao_deve_perguntar) == [],
           "tudo informado por opção: não pergunta nada")
+
+    print("\n[11] --fonte api: formato real, limite de 366 dias, token (servidor simulado)")
+    import json as _json
+    import datetime as _dt
+    import time as _time
+    # (a) item real da API -> leituras diárias
+    item = {f"Chuva_{d:02d}{suf}": (f"{REAL_JAN2020[d - 1]}" if not suf else "1")
+            for d in range(1, 32) for suf in ("", "_Status")}
+    item.update({"Data_Hora_Dado": "2020-01-01 00:00:00.0", "Data_Ultima_Alteracao": "2020-07-24 00:00:00.0",
+                 "Dia_Maxima": "22", "Maxima": "70.0", "Nivel_Consistencia": "1", "Numero_Dias_de_Chuva": "18",
+                 "Tipo_Medicao_Chuvas": "1", "Total": "325.2", "Total_Anual": None, "Total_Anual_Status": "0",
+                 "Total_Status": "1", "codigoestacao": "1646001"})
+    dj = hp.wide_para_diario(hp.itens_para_largo([item], 1646001))
+    check(len(dj) == 31 and abs(dj.chuva.sum() - 325.2) < 1e-6 and dj.nivel.eq(1).all()
+          and dj.total_arq.eq(325.2).all() and (dj.ano == 2020).all() and (dj.mes == 1).all(),
+          "item real da API (jan/2020, estação 1646001): 31 dias somam o Total 325,2")
+    # (b) token
+    JWT_OK = montar_jwt(int(_time.time()) + 3600)
+    exp = hp.expiracao_jwt(JWT_OK)
+    check(exp is not None and abs(exp.timestamp() - (_time.time() + 3600)) < 5, "expiração lida do JWT")
+    check(hp.expiracao_jwt("isto-nao-e-jwt") is None, "token ilegível não quebra a leitura da expiração")
+    # (c) servidor simulado
+    dados_api = {A: itens_api(registros[A]), B: itens_api(registros[B]), C: itens_api(registros[C])}
+    pedidos: list = []
+    chamadas_api = [0]          # todas as chamadas, inclusive as recusadas com 401
+
+    class HA(http.server.BaseHTTPRequestHandler):
+        def _json(self, corpo):
+            b = _json.dumps(corpo).encode()
+            self.send_response(corpo["code"]); self.send_header("Content-Type", "application/json")
+            self.end_headers(); self.wfile.write(b)
+
+        def do_GET(self):
+            chamadas_api[0] += 1
+            if self.headers.get("Authorization") != f"Bearer {JWT_OK}":
+                return self._json({"status": "UNAUTHORIZED", "code": 401, "message": "Token inválido", "items": None})
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            cod = int(q["Código da Estação"][0])
+            ini = _dt.date.fromisoformat(q["Data Inicial (yyyy-MM-dd)"][0])
+            fim = _dt.date.fromisoformat(q["Data Final (yyyy-MM-dd)"][0])
+            assert q["Tipo Filtro Data"] == ["DATA_LEITURA"]
+            pedidos.append((cod, ini, fim))
+            if (fim - ini).days > 366:
+                return self._json({"status": "NOT_ACCEPTABLE", "code": 406, "items": None,
+                                   "message": "Intervalo entre datas superior ao limite permitido de 366 dias. Verifique!"})
+            itens = [it for it in dados_api.get(cod, [])
+                     if ini <= _dt.date.fromisoformat(it["Data_Hora_Dado"][:10]) <= fim]
+            self._json({"status": "OK", "code": 200, "message": "Sucesso", "items": itens or None})
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HA)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    envA = {"HIDROWEB_API_URL": f"http://127.0.0.1:{srv.server_address[1]}/HidroSerieChuva/v1",
+            "HIDROWEB_TOKEN": JWT_OK, "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
+    base = ["--fonte", "api", "--ano-inicial", "2000", "--ano-final", "2010", "--min-anos", "10",
+            "--max-falhas-pct", "10", "--pausa", "0"]
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api")], envA, criterios=False)
+    check(r.returncode == 0, f"execução api terminou (stdout: {r.stdout[-300:]!r})")
+    check(len(pedidos) == 44, f"44 requisições = 4 estações x 11 anos ({len(pedidos)})")
+    check(all((f - i).days <= 366 for _, i, f in pedidos) and pedidos[0][1:] == (_dt.date(2000, 1, 1), _dt.date(2000, 12, 31)),
+          "cada requisição cobre 1 ano (dentro do limite de 366 dias)")
+    ra = pd.read_csv(RAIZ / "out_api" / "resumo_geral.csv", sep=";", decimal=",", encoding="utf-8-sig",
+                     dtype={"Código": str})
+    sa = dict(zip(ra["Código"], ra["Situação"]))
+    check(sa == {"01944009": "Aprovada", "02047001": "Aprovada", "02047002": "Aprovada", "02547005": "Sem dados"},
+          f"situações via api: {sa}")
+    for cod in (A, B, C):
+        la, lw = ra[ra["Código"] == hp.fmt(cod)].iloc[0], rj[rj["Código"] == hp.fmt(cod)].iloc[0]
+        check(all(abs(la[f"P_{m} (mm)"] - lw[f"P_{m} (mm)"]) < 1e-9 for m in hp.MESES)
+              and la["Meses com falha"] == lw["Meses com falha"],
+              f"{hp.fmt(cod)}: médias e falhas via api = via arquivos locais (mesma janela)")
+    todos_arqs = [p for p in (RAIZ / "out_api").rglob("*") if p.is_file() and p.suffix in (".txt", ".json", ".csv")]
+    check(not any(JWT_OK in p.read_text(encoding="utf-8", errors="ignore") for p in todos_arqs),
+          "o token não aparece em nenhum arquivo de saída nem no log")
+    n = len(pedidos)
+    envMorto = dict(envA, HIDROWEB_API_URL="http://127.0.0.1:9/x")
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api")], envMorto, criterios=False)
+    check(r.returncode == 0 and len(pedidos) == n, "segunda execução reaproveita o JSON salvo (sem rede)")
+    # (d) falhas de token: interrompem a execução com mensagem clara
+    n = len(pedidos)
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api_t1")], dict(envA, HIDROWEB_TOKEN=montar_jwt(int(_time.time()) + 3600) + "x"),
+              criterios=False)
+    check(r.returncode == 1 and "recusou o token" in r.stdout and "Traceback" not in r.stderr,
+          "token recusado (401): interrompe com mensagem clara")
+    antes = chamadas_api[0]
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api_t2")], dict(envA, HIDROWEB_TOKEN=montar_jwt(int(_time.time()) - 60)),
+              criterios=False)
+    check(r.returncode == 1 and "expirado" in r.stdout and chamadas_api[0] == antes,
+          "token expirado: recusado antes de chamar a API")
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api_t3")], dict(envA, HIDROWEB_TOKEN=""), criterios=False)
+    check(r.returncode == 1 and "HIDROWEB_TOKEN" in r.stdout, "sem token e sem terminal: pede a variável HIDROWEB_TOKEN")
+    srv.shutdown()
 
     # amostra para o usuário (dados inventados)
     shutil.copy(out / "estacoes" / "02047001.xlsx", AQUI / "exemplo_SINTETICO_estacao_02047001.xlsx")
