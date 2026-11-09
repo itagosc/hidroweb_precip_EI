@@ -18,6 +18,9 @@ python hidroweb_precip.py estacoes.txt --fonte local --pasta baixados --saida sa
 
 # baixando pela API da ANA (precisa do token; ver a seção sobre fontes):
 export HIDROWEB_TOKEN='cole_o_tokenautenticacao'      # vale ~1 hora; não vai para arquivo nem log
+# ou, para o programa obter e renovar o token sozinho (listas grandes):
+read -rp "Identificador: " HIDROWEB_IDENTIFICADOR; read -rsp "Senha: " HIDROWEB_SENHA; echo
+export HIDROWEB_IDENTIFICADOR HIDROWEB_SENHA
 python hidroweb_precip.py estacoes.txt --fonte api --saida saida \
     --ano-inicial 1991 --ano-final 2020 --min-anos 20 --max-falhas-pct 10
 
@@ -34,7 +37,7 @@ Códigos com 7 ou 8 dígitos funcionam; duplicatas e lixo são ignorados.
 | `--fonte api` | API HidroWebService da ANA (`HidroSerieChuva/v1`, JSON). Uma requisição **por ano** (a API recusa intervalos acima de 366 dias). Token JWT (`tokenautenticacao`) em `HIDROWEB_TOKEN`; se faltar e houver terminal, é pedido sem eco. Guarda o JSON em `dados_brutos/` e o reaproveita (`--refazer` baixa de novo). | **Formato e limite de 366 dias confirmados com a API real** (estação 1646001, 09/11/2026). Ainda não rodado ao vivo: várias estações em sequência, anos sem dado (tratados como vazios), renovação do token. Se o token expirar no meio, a execução para com mensagem clara; sem `--ano-inicial` ele busca desde 1900, o que é lento. |
 | `--fonte ws` | WebService público da ANA (`HidroSerieHistorica`, chuva = tipo 2), com 6 tentativas e espera crescente | **Não testado ao vivo** (o ambiente de desenvolvimento não alcança o servidor da ANA). A lógica foi validada contra um servidor falso que imita o formato documentado. A ANA indica que uma API nova substituirá este serviço, então ele pode mudar ou sair do ar. |
 | `--fonte local` | Arquivos baixados do portal Hidroweb: `.zip` (inclusive zip dentro de zip), `.csv`, `.txt`, `.xlsx` | Formato assumido: uma linha por mês, colunas `EstacaoCodigo`, `NivelConsistencia`, `Data`, `Chuva01…Chuva31`, `Chuva01Status…`. Linhas `//`, separador `;`, vírgula decimal e latin-1 são aceitos. `.mdb` não é lido. |
-| Renovação automática do token | A API entrega o token a partir de identificador e senha cadastrados na ANA | Não implementada. Hoje o token é gerado por você e colado em `HIDROWEB_TOKEN`. |
+| Token por identificador/senha | Com `HIDROWEB_IDENTIFICADOR` e `HIDROWEB_SENHA`, o programa obtém o token (rota `EstacoesTelemetricas/OAUth/v1`, cabeçalhos `Identificador` e `Senha`, token em `items.tokenautenticacao`) e o renova a menos de 5 min de expirar ou quando a API o recusa. Credenciais só por variável de ambiente; nunca em arquivo, log ou opção de linha de comando. | A **estrutura da resposta** foi confirmada com a API real. Os cabeçalhos e o endereço dessa rota vieram de memória: se a ANA recusar (mensagem "identificador/senha"), confira o endereço no manual e use `HIDROWEB_AUTH_URL`. |
 
 Se o seu arquivo real divergir do formato assumido, o programa avisa qual arquivo não entendeu. Mande as primeiras linhas dele para ajustar.
 

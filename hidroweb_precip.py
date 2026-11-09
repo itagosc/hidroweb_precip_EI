@@ -16,7 +16,8 @@ Fluxo
                     com retentativas e espera crescente;
      --fonte api    baixa da API HidroWebService da ANA (HidroSerieChuva v1), uma
                     requisição por ano (limite de 366 dias da API). Exige o token
-                    JWT na variável de ambiente HIDROWEB_TOKEN (ou pedido sem eco);
+                    JWT em HIDROWEB_TOKEN (ou pedido sem eco) ou HIDROWEB_IDENTIFICADOR +
+                    HIDROWEB_SENHA (o programa obtém e renova o token sozinho);
      --fonte local  lê arquivos já baixados do portal Hidroweb (.zip, .csv,
                     .txt, .xlsx) em --pasta; zips são descompactados.
 3. Escolhe, mês a mês, a melhor série (nível 2 = consistido; nível 1 = bruto
@@ -65,6 +66,9 @@ WS_URL = os.environ.get(
 )
 API_URL = os.environ.get(
     "HIDROWEB_API_URL", "https://www.ana.gov.br/hidrowebservice/EstacoesTelemetricas/HidroSerieChuva/v1"
+)
+AUTH_URL = os.environ.get(
+    "HIDROWEB_AUTH_URL", "https://www.ana.gov.br/hidrowebservice/EstacoesTelemetricas/OAUth/v1"
 )
 COLS_DIARIO = ["cod", "ano", "mes", "dia", "chuva", "status", "nivel", "total_arq"]
 LOG = logging.getLogger("hidroweb")
@@ -268,28 +272,92 @@ def expiracao_jwt(token: str):
         return None
 
 
-def obter_token(interativo: bool) -> str:
-    """Lê o token de HIDROWEB_TOKEN (ou pede sem eco no terminal). Nunca por opção de linha
-    de comando (ficaria no histórico) e nunca é gravado em arquivo nem no log."""
+def pedir_token(identificador: str, senha: str, tentativas: int = 3):
+    """Troca identificador e senha (cadastro na ANA) por um token. Devolve (token, expiração)."""
+    import requests
+    cab = {"Identificador": identificador, "Senha": senha, "Accept": "application/json",
+           "User-Agent": "hidroweb-precip/1.0"}
+    ultimo = ""
+    for t in range(1, tentativas + 1):
+        try:
+            r = requests.get(AUTH_URL, headers=cab, timeout=60)
+        except requests.RequestException as e:
+            ultimo = type(e).__name__             # só o tipo: nunca ecoar cabeçalhos
+        else:
+            try:
+                corpo = r.json()
+            except ValueError:
+                corpo = None
+            itens = corpo.get("items") if isinstance(corpo, dict) else None
+            tok = itens.get("tokenautenticacao") if isinstance(itens, dict) else None
+            if r.status_code == 200 and tok:
+                return tok, expiracao_jwt(tok)
+            msg = corpo.get("message", "") if isinstance(corpo, dict) else ""
+            if r.status_code in (400, 401, 403):
+                raise ErroToken(f"a ANA recusou o identificador/senha (HTTP {r.status_code} {msg}); "
+                                "confira HIDROWEB_IDENTIFICADOR e HIDROWEB_SENHA")
+            ultimo = f"HTTP {r.status_code}"
+        time.sleep(2 * t)
+    raise ErroToken(f"não foi possível obter o token ({ultimo})")
+
+
+class GestorToken:
+    """Guarda o token e, se houver identificador/senha, renova perto de expirar ou quando a API recusa."""
+
+    def __init__(self, token: str = "", identificador: str = "", senha: str = ""):
+        self.valor = token
+        self.exp = expiracao_jwt(token) if token else None
+        self._id, self._senha = identificador, senha
+
+    @property
+    def pode_renovar(self) -> bool:
+        return bool(self._id and self._senha)
+
+    def renovar(self) -> bool:
+        if not self.pode_renovar:
+            return False
+        self.valor, self.exp = pedir_token(self._id, self._senha)
+        LOG.info("Token obtido/renovado%s.",
+                 f" (vale até {self.exp.astimezone():%H:%M})" if self.exp else "")
+        return True
+
+    def token(self) -> str:
+        if self.pode_renovar and (not self.valor or (
+                self.exp is not None and (self.exp - datetime.now(timezone.utc)).total_seconds() < 300)):
+            self.renovar()
+        return self.valor
+
+
+def obter_token(interativo: bool) -> GestorToken:
+    """Token de HIDROWEB_TOKEN, ou obtido com HIDROWEB_IDENTIFICADOR + HIDROWEB_SENHA, ou pedido sem
+    eco no terminal. Nada disso vem por opção de linha de comando (ficaria no histórico) e nada é
+    gravado em arquivo ou log."""
     tok = os.environ.get("HIDROWEB_TOKEN", "").strip()
-    if not tok:
-        if not interativo:
-            raise ErroToken("token ausente: defina a variável de ambiente HIDROWEB_TOKEN "
-                            "com o tokenautenticacao")
-        import getpass
-        tok = getpass.getpass("Cole o tokenautenticacao (não aparece na tela): ").strip()
-        if not tok:
-            raise ErroToken("token ausente")
+    ident = os.environ.get("HIDROWEB_IDENTIFICADOR", "").strip()
+    senha = os.environ.get("HIDROWEB_SENHA", "")
     if tok.lower().startswith("bearer "):
         tok = tok[7:].strip()
-    exp = expiracao_jwt(tok)
-    if exp is not None:
-        restante = (exp - datetime.now(timezone.utc)).total_seconds() / 60
-        if restante <= 0:
-            raise ErroToken(f"token expirado em {exp.astimezone():%d/%m/%Y %H:%M}; gere outro")
-        if restante < 10:
-            LOG.warning("O token expira em %.0f min; a execução pode ser interrompida.", restante)
-    return tok
+    g = GestorToken(tok, ident, senha)
+    if tok:
+        exp = g.exp
+        if exp is not None:
+            restante = (exp - datetime.now(timezone.utc)).total_seconds() / 60
+            if restante <= 0 and not g.pode_renovar:
+                raise ErroToken(f"token expirado em {exp.astimezone():%d/%m/%Y %H:%M}; gere outro")
+            if 0 < restante < 10 and not g.pode_renovar:
+                LOG.warning("O token expira em %.0f min; a execução pode ser interrompida.", restante)
+        return g
+    if g.pode_renovar:
+        g.renovar()
+        return g
+    if not interativo:
+        raise ErroToken("token ausente: defina HIDROWEB_TOKEN (o tokenautenticacao) ou "
+                        "HIDROWEB_IDENTIFICADOR e HIDROWEB_SENHA")
+    import getpass
+    tok = getpass.getpass("Cole o tokenautenticacao (não aparece na tela): ").strip()
+    if not tok:
+        raise ErroToken("token ausente")
+    return GestorToken(tok)
 
 
 def _url_api(cod: int, ini: str, fim: str) -> str:
@@ -335,7 +403,7 @@ def _pedir_api(url: str, token: str, tentativas: int = 5) -> list:
     raise RuntimeError(f"API indisponível após {tentativas} tentativas ({ultimo})")
 
 
-def baixar_api(cod: int, ano_ini: int, ano_fim: int, pasta_bruto: Path, token: str,
+def baixar_api(cod: int, ano_ini: int, ano_fim: int, pasta_bruto: Path, gestor: "GestorToken",
                refazer: bool, pausa: float) -> list:
     """Uma requisição por ano (a API recusa intervalos acima de 366 dias). Guarda o JSON
     (só dados, sem token) para reaproveitar nas próximas execuções."""
@@ -344,7 +412,13 @@ def baixar_api(cod: int, ano_ini: int, ano_fim: int, pasta_bruto: Path, token: s
         return json.loads(destino.read_text(encoding="utf-8"))
     itens: list = []
     for ano in range(ano_ini, ano_fim + 1):
-        itens += _pedir_api(_url_api(cod, f"{ano}-01-01", f"{ano}-12-31"), token)
+        url = _url_api(cod, f"{ano}-01-01", f"{ano}-12-31")
+        try:
+            itens += _pedir_api(url, gestor.token())
+        except ErroToken:
+            if not gestor.renovar():          # sem identificador/senha: não há como renovar
+                raise
+            itens += _pedir_api(url, gestor.token())
         time.sleep(pausa)
     destino.write_text(json.dumps(itens, ensure_ascii=False), encoding="utf-8")
     return itens
@@ -896,7 +970,7 @@ def main(argv=None) -> int:
         diarios = carregar_local(Path(a.pasta), saida / "extraidos", set(codigos))
     elif a.fonte == "api":
         try:
-            token = obter_token(interativo)
+            gestor = obter_token(interativo)
         except ErroToken as e:
             LOG.error("%s", e)
             return 1
@@ -908,7 +982,7 @@ def main(argv=None) -> int:
         pausa = a.pausa if a.pausa is not None else 0.5
         for cod in codigos:
             try:
-                itens = baixar_api(cod, ano_i, ano_f, saida / "dados_brutos", token, a.refazer, pausa)
+                itens = baixar_api(cod, ano_i, ano_f, saida / "dados_brutos", gestor, a.refazer, pausa)
                 diarios[cod] = wide_para_diario(itens_para_largo(itens, cod))
                 LOG.info("Estação %s: %d leituras diárias", fmt(cod), len(diarios[cod]))
             except ErroToken as e:

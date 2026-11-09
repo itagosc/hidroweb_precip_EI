@@ -461,6 +461,10 @@ def main() -> int:
     dados_api = {A: itens_api(registros[A]), B: itens_api(registros[B]), C: itens_api(registros[C])}
     pedidos: list = []
     chamadas_api = [0]          # todas as chamadas, inclusive as recusadas com 401
+    chamadas_auth: list = []    # chamadas à rota de login
+    emitidos: list = []         # tokens emitidos pelo login simulado
+    validos = {JWT_OK}          # tokens que a API simulada aceita
+    derruba = [0]               # se > 0: na chamada de número N a API "expira" todos os tokens
 
     class HA(http.server.BaseHTTPRequestHandler):
         def _json(self, corpo):
@@ -469,8 +473,21 @@ def main() -> int:
             self.end_headers(); self.wfile.write(b)
 
         def do_GET(self):
+            if self.path.startswith("/OAUth/v1"):
+                chamadas_auth.append(1)
+                if self.headers.get("Identificador") != "id-teste" or self.headers.get("Senha") != "senha-teste":
+                    return self._json({"status": "BAD_REQUEST", "code": 400, "message": "Credenciais inválidas",
+                                       "items": None})
+                novo = montar_jwt(int(_time.time()) + 3600 + len(emitidos))
+                emitidos.append(novo); validos.add(novo)
+                return self._json({"status": "OK", "code": 200, "message": "Sucesso",
+                                   "items": {"sucesso": True, "token": "0123abcd", "validade": "Mon Nov 09 19:17:10",
+                                             "retorno": None, "httpStatus": "OK", "link": None, "tokenValido": None,
+                                             "tokenautenticacao": novo, "respostaautenticacao": "Sucesso"}})
             chamadas_api[0] += 1
-            if self.headers.get("Authorization") != f"Bearer {JWT_OK}":
+            if derruba[0] and chamadas_api[0] == derruba[0]:
+                validos.clear()
+            if self.headers.get("Authorization") not in {f"Bearer {t}" for t in validos}:
                 return self._json({"status": "UNAUTHORIZED", "code": 401, "message": "Token inválido", "items": None})
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             cod = int(q["Código da Estação"][0])
@@ -529,6 +546,43 @@ def main() -> int:
           "token expirado: recusado antes de chamar a API")
     r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api_t3")], dict(envA, HIDROWEB_TOKEN=""), criterios=False)
     check(r.returncode == 1 and "HIDROWEB_TOKEN" in r.stdout, "sem token e sem terminal: pede a variável HIDROWEB_TOKEN")
+    # (e) só identificador/senha: o programa obtém o token sozinho
+    envC = dict(envA, HIDROWEB_IDENTIFICADOR="id-teste", HIDROWEB_SENHA="senha-teste",
+                HIDROWEB_AUTH_URL=f"http://127.0.0.1:{srv.server_address[1]}/OAUth/v1")
+    chamadas_auth.clear()
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api_c1")], dict(envC, HIDROWEB_TOKEN=""), criterios=False)
+    check(r.returncode == 0 and len(chamadas_auth) == 1,
+          f"só identificador/senha: obtém o token sozinho (1 login; saída: {r.stdout[-120:]!r})")
+    # (f) token vencido ou perto de vencer + credenciais: renova em vez de recusar
+    chamadas_auth.clear()
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api_c2")],
+              dict(envC, HIDROWEB_TOKEN=montar_jwt(int(_time.time()) - 60)), criterios=False)
+    check(r.returncode == 0 and len(chamadas_auth) == 1, "token vencido + credenciais: renova e segue")
+    chamadas_auth.clear()
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api_c3")],
+              dict(envC, HIDROWEB_TOKEN=montar_jwt(int(_time.time()) + 100)), criterios=False)
+    check(r.returncode == 0 and len(chamadas_auth) == 1, "token a menos de 5 min do fim + credenciais: renova antes de usar")
+    # (g) a API recusa o token no meio da execução: renova e repete a requisição
+    chamadas_auth.clear()
+    derruba[0] = chamadas_api[0] + 15
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api_c4")], dict(envC, HIDROWEB_TOKEN=JWT_OK), criterios=False)
+    derruba[0] = 0
+    rc4 = pd.read_csv(RAIZ / "out_api_c4" / "resumo_geral.csv", sep=";", decimal=",", encoding="utf-8-sig",
+                      dtype={"Código": str})
+    iguais = all(abs(rc4.loc[rc4["Código"] == hp.fmt(c), f"P_{m} (mm)"].iloc[0]
+                     - ra.loc[ra["Código"] == hp.fmt(c), f"P_{m} (mm)"].iloc[0]) < 1e-9
+                 for c in (A, B, C) for m in hp.MESES)
+    check(r.returncode == 0 and len(chamadas_auth) == 1 and iguais,
+          "token derrubado no meio da execução: renova uma vez e o resultado é idêntico")
+    # (h) senha errada; credenciais nunca aparecem em saídas
+    r = rodar([str(ws_txt), *base, "--saida", str(RAIZ / "out_api_c5")],
+              dict(envC, HIDROWEB_TOKEN="", HIDROWEB_SENHA="senha-errada"), criterios=False)
+    check(r.returncode == 1 and "identificador/senha" in r.stdout + r.stderr and "senha-errada" not in r.stdout + r.stderr
+          and "Traceback" not in r.stderr, "senha errada: interrompe com mensagem clara, sem ecoar a senha")
+    segredos = ["senha-teste", "senha-errada", "id-teste"] + emitidos + [JWT_OK]
+    arqs = [p for d in RAIZ.glob("out_api*") for p in d.rglob("*") if p.is_file() and p.suffix in (".txt", ".json", ".csv")]
+    check(arqs and not any(sg in p.read_text(encoding="utf-8", errors="ignore") for p in arqs for sg in segredos),
+          "nem tokens nem credenciais aparecem em arquivos de saída ou logs")
     srv.shutdown()
 
     # amostra para o usuário (dados inventados)
